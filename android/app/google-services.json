@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "138958715499",
+    "project_id": "ineedcaffeine",
+    "storage_bucket": "ineedcaffeine.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:138958715499:android:38f24f8f97e2cf02fdcf2e",
+        "android_client_info": {
+          "package_name": "com.example.sdtt"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBx2okGWufCda9nLLE-S5s-CW7sJz06JHw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
