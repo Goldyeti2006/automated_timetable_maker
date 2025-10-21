@@ -43,7 +43,7 @@ class _StudentHomeState extends State<StudentHome> {
   Widget build(BuildContext context) {
     final days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
     final slots = [
-      "09:00-09:55", "10:00-10:55", "11:00-11:55", "12:00-12:55",
+      "09:00-09:55", "10:00-10:55", "11:00-11:55", "12:00-12:55","13:55-14:55",
       "14:00-14:55", "15:00-15:55", "16:00-16:55"
     ];
 

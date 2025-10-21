@@ -1,3 +1,4 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import '../models/classroom.dart';
@@ -7,19 +8,20 @@ import '../services/db_service.dart';
 import 'login_screen.dart';
 import 'dart:math';
 
-// HELPER CLASS 1: TimeSlot
+// NEW: The missing TimeSlot helper class
 class TimeSlot {
   final int id;
   final String label;
   TimeSlot({required this.id, required this.label});
 }
 
-// HELPER CLASS 2: SchedulableEvent
+// Helper class for a specific class instance to be scheduled
 class SchedulableEvent {
   final Course course;
   final String eventType;
   final int duration;
   final int instance;
+  bool isScheduled = false; // To track if this specific event has been placed
 
   SchedulableEvent({
     required this.course,
@@ -27,19 +29,6 @@ class SchedulableEvent {
     this.duration = 1,
     required this.instance,
   });
-
-  // Unique key for reliably tracking this specific event
-  String get uniqueKey => '${course.courseId}-${eventType}-${instance}';
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-          other is SchedulableEvent &&
-              runtimeType == other.runtimeType &&
-              uniqueKey == other.uniqueKey;
-
-  @override
-  int get hashCode => uniqueKey.hashCode;
 }
 
 class AdminHome extends StatefulWidget {
@@ -49,18 +38,11 @@ class AdminHome extends StatefulWidget {
 
 class _AdminHomeState extends State<AdminHome> {
   final DBService _db = DBService();
-  List<Classroom> classrooms = [];
   bool _isLoading = false;
 
   final _roomIdController = TextEditingController();
   final _capacityController = TextEditingController();
   String _roomType = "Lecture";
-
-  @override
-  void initState() {
-    super.initState();
-    _loadClassrooms();
-  }
 
   // Boilerplate functions are unchanged
   Future<void> _signOut() async {
@@ -69,15 +51,6 @@ class _AdminHomeState extends State<AdminHome> {
       MaterialPageRoute(builder: (context) => LoginScreen()),
           (Route<dynamic> route) => false,
     );
-  }
-
-  Future<void> _loadClassrooms() async {
-    final data = await _db.getClassrooms();
-    if (mounted) {
-      setState(() {
-        classrooms = data;
-      });
-    }
   }
 
   void _addClassroom() async {
@@ -94,11 +67,10 @@ class _AdminHomeState extends State<AdminHome> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Classroom Added Successfully')));
     _roomIdController.clear();
     _capacityController.clear();
-    _loadClassrooms();
   }
 
   // =======================================================================
-  // ================= THE NEW TIMETABLE ALGORITHM V8 ======================
+  // ================= THE NEW TIMETABLE ALGORITHM V16 =====================
   // =======================================================================
   Future<void> _generateTimetable() async {
     setState(() => _isLoading = true);
@@ -121,6 +93,7 @@ class _AdminHomeState extends State<AdminHome> {
       TimeSlot(id: 6, label: "15:00-15:55"), TimeSlot(id: 7, label: "16:00-16:55"),
     ];
 
+    // 1. Prepare all events that need to be scheduled
     List<SchedulableEvent> eventsToSchedule = [];
     for (var course in courses) {
       int lectureHours = course.hoursPerWeek;
@@ -137,142 +110,113 @@ class _AdminHomeState extends State<AdminHome> {
       }
     }
 
-    // Data structures for tracking
-    Map<String, String> teacherSchedule = {};
-    Map<String, String> roomSchedule = {};
-    Map<String, bool> isLabDay = {};
-    Map<String, bool> lectureScheduledToday = {};
-    Set<String> successfullyScheduledKeys = {}; // NEW: Reliable tracking using unique keys
+    // This is the single, permanent "notebook" for the schedule's state
+    // It makes double-booking logically impossible.
+    Set<String> busySlots = {}; // Format: "ResourceType-ResourceID-Day-SlotID"
 
-    // ================== PASS 1: The "Ideal" Randomized Pass ==================
-    // Prioritize labs first, then shuffle the rest
-    final labs = eventsToSchedule.where((e) => e.eventType == "Lab").toList();
-    final others = eventsToSchedule.where((e) => e.eventType != "Lab").toList()..shuffle();
-    final pass1Events = [...labs, ...others];
+    // 2. The Main "Grid-First" Loop
+    for (var day in days) {
+      for (var startSlot in timeSlots) {
 
-    for (var event in pass1Events) {
-      final shuffledDays = [...days]..shuffle();
-      await _tryScheduleEvent(event, shuffledDays, timeSlots, rooms, teacherSchedule, roomSchedule, isLabDay, lectureScheduledToday, successfullyScheduledKeys, relaxConstraints: false);
-    }
+        // Is this specific slot already occupied? If so, skip it.
+        if (busySlots.any((key) => key.endsWith("-$day-${startSlot.id}"))) continue;
 
-    // ================== PASS 2: The "Guarantee" Deterministic Pass ==================
-    final unscheduledEvents = eventsToSchedule.where((e) => !successfullyScheduledKeys.contains(e.uniqueKey)).toList();
+        // Shuffle events to ensure fairness and distribution
+        final unscheduledEvents = eventsToSchedule.where((e) => !e.isScheduled).toList()..shuffle();
 
-    if (unscheduledEvents.isNotEmpty) {
-      for (var event in unscheduledEvents) {
-        // Use the original, non-shuffled list of days and relax the "no consecutive teacher" rule
-        await _tryScheduleEvent(event, days, timeSlots, rooms, teacherSchedule, roomSchedule, isLabDay, lectureScheduledToday, successfullyScheduledKeys, relaxConstraints: true);
+        for (var event in unscheduledEvents) {
+          final startIndex = timeSlots.indexOf(startSlot);
+          if (startIndex + event.duration > timeSlots.length) continue;
+
+          final blockSlots = timeSlots.sublist(startIndex, startIndex + event.duration);
+
+          // --- CHECK CONSTRAINTS ---
+          bool canSchedule = true;
+          Classroom? availableRoom;
+
+          // Soft Constraints
+          if (event.eventType == "Lab" && busySlots.any((k) => k.startsWith("LabDay-$day"))) continue;
+          if (event.eventType == "Lecture" && busySlots.any((k) => k.startsWith("LectureDay-${event.course.courseId}-$day"))) continue;
+
+          // Hard Constraints: Check Teacher and Room availability for the entire block
+          for (var slot in blockSlots) {
+            final teacherKey = "Teacher-${event.course.teacherId}-$day-${slot.id}";
+            if (busySlots.contains(teacherKey)) {
+              canSchedule = false;
+              break;
+            }
+          }
+          if (!canSchedule) continue;
+
+          // Find a free room
+          for (var room in rooms..shuffle()) {
+            bool typeMatch = (event.eventType == "Lab" && room.type == "Lab") || (event.eventType != "Lab" && room.type == "Lecture");
+            if (!typeMatch) continue;
+
+            bool roomIsFree = true;
+            for (var slot in blockSlots) {
+              final roomKey = "Room-${room.roomId}-$day-${slot.id}";
+              if (busySlots.contains(roomKey)) {
+                roomIsFree = false;
+                break;
+              }
+            }
+            if (roomIsFree) {
+              availableRoom = room;
+              break;
+            }
+          }
+
+          // If all checks pass, place the event and LOCK the slots
+          if (canSchedule && availableRoom != null) {
+            for (var slot in blockSlots) {
+              busySlots.add("Teacher-${event.course.teacherId}-$day-${slot.id}");
+              busySlots.add("Room-${availableRoom.roomId}-$day-${slot.id}");
+
+              final entry = TimetableEntry(
+                courseId: "${event.course.courseId} (${event.eventType})", baseCourseId: event.course.courseId, courseName: "${event.course.courseName} (${event.eventType})",
+                teacherId: event.course.teacherId, roomId: availableRoom.roomId, day: day, slot: slot.label,
+              );
+              await _db.addTimetableEntry(entry);
+            }
+
+            if (event.eventType == "Lab") busySlots.add("LabDay-$day");
+            if (event.eventType == "Lecture") busySlots.add("LectureDay-${event.course.courseId}-$day");
+
+            event.isScheduled = true;
+            break; // A class was scheduled in this slot, move to the next slot in the grid
+          }
+        }
       }
     }
 
-    final finalUnscheduled = eventsToSchedule.where((e) => !successfullyScheduledKeys.contains(e.uniqueKey)).toList();
+    final totalRequired = eventsToSchedule.length;
+    final totalScheduled = eventsToSchedule.where((e) => e.isScheduled).length;
 
     setState(() => _isLoading = false);
-    if(finalUnscheduled.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Timetable Generated Successfully! All classes scheduled.')));
+    if (totalScheduled >= totalRequired) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Timetable Generated Successfully! All ${eventsToSchedule.map((e) => e.duration).reduce((a,b)=>a+b)} hours scheduled.')));
     } else {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Timetable Generated, but ${finalUnscheduled.length} classes could not be scheduled. Please check constraints or add more rooms/slots.'),
+        content: Text('Timetable Generated, but only ${totalScheduled}/${totalRequired} classes could be scheduled. Please add more rooms/slots.'),
         backgroundColor: Colors.red,
       ));
     }
   }
 
-  Future<bool> _tryScheduleEvent(
-      SchedulableEvent event,
-      List<String> daysToTry,
-      List<TimeSlot> timeSlots,
-      List<Classroom> rooms,
-      Map<String, String> teacherSchedule,
-      Map<String, String> roomSchedule,
-      Map<String, bool> isLabDay,
-      Map<String, bool> lectureScheduledToday,
-      Set<String> successfullyScheduledKeys,
-      {required bool relaxConstraints}) async {
-
-    for (var day in daysToTry) {
-      if (event.eventType == "Lab" && isLabDay.containsKey(day)) continue;
-      if (event.eventType == "Lecture" && lectureScheduledToday.containsKey("${event.course.courseId}-$day")) continue;
-
-      for (int i = 0; i <= timeSlots.length - event.duration; i++) {
-        final blockSlots = timeSlots.sublist(i, i + event.duration);
-        bool blockIsFree = true;
-        Classroom? availableRoom;
-
-        for (var slot in blockSlots) {
-          final teacherKey = "${event.course.teacherId}-$day-${slot.id}";
-          if (teacherSchedule.containsKey(teacherKey)) {
-            blockIsFree = false;
-            break;
-          }
-          // Only check previous teacher slot if we are NOT relaxing constraints
-          if (!relaxConstraints) {
-            final prevTeacherKey = "${event.course.teacherId}-$day-${slot.id - 1}";
-            if (teacherSchedule.containsKey(prevTeacherKey)) {
-              blockIsFree = false;
-              break;
-            }
-          }
-        }
-        if (!blockIsFree) continue;
-
-        for (var room in rooms) {
-          bool roomIsFreeForBlock = true;
-          for (var slot in blockSlots) {
-            final roomKey = "${room.roomId}-$day-${slot.id}";
-            if (roomSchedule.containsKey(roomKey)) {
-              roomIsFreeForBlock = false;
-              break;
-            }
-          }
-          if (roomIsFreeForBlock) {
-            bool typeMatch = (event.eventType == "Lab" && room.type == "Lab") || (event.eventType != "Lab" && room.type == "Lecture");
-            if (typeMatch) {
-              availableRoom = room;
-              break;
-            }
-          }
-        }
-
-        if (blockIsFree && availableRoom != null) {
-          for (var slot in blockSlots) {
-            final teacherKey = "${event.course.teacherId}-$day-${slot.id}";
-            final roomKey = "${availableRoom.roomId}-$day-${slot.id}";
-            teacherSchedule[teacherKey] = event.course.courseId;
-            roomSchedule[roomKey] = event.course.courseId;
-
-            final entry = TimetableEntry(
-              courseId: "${event.course.courseId} (${event.eventType} ${event.instance > 0 ? event.instance + 1 : ''})".trim(),
-              baseCourseId: event.course.courseId,
-              courseName: "${event.course.courseName} (${event.eventType})",
-              teacherId: event.course.teacherId,
-              roomId: availableRoom.roomId,
-              day: day,
-              slot: slot.label,
-            );
-            await _db.addTimetableEntry(entry);
-          }
-
-          if (event.eventType == "Lab") isLabDay[day] = true;
-          if (event.eventType == "Lecture") lectureScheduledToday["${event.course.courseId}-$day"] = true;
-
-          successfullyScheduledKeys.add(event.uniqueKey);
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
   @override
   Widget build(BuildContext context) {
-    // The build method remains unchanged
     return Scaffold(
+      backgroundColor: Color(0xFF12212D),
       appBar: AppBar(
-        title: Text("Admin Dashboard"),
+        backgroundColor: Color(0xFF577389),
+        title: Center(
+          child: Text("Admin Dashboard",style: TextStyle(
+            color: Color(0xFFFFFFFF))),
+        ),
         actions: [
           IconButton(
-            icon: Icon(Icons.logout),
+            icon: Icon(Icons.logout,color: Color(0xFFFFFFFF),),
             tooltip: 'Log Out',
             onPressed: _signOut,
           ),
@@ -283,45 +227,93 @@ class _AdminHomeState extends State<AdminHome> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            TextField(controller: _roomIdController, decoration: InputDecoration(labelText: "Room ID (e.g., C-101)")),
-            TextField(controller: _capacityController, decoration: InputDecoration(labelText: "Capacity"), keyboardType: TextInputType.number),
-            DropdownButton<String>(
+            TextField(controller: _roomIdController, decoration: InputDecoration(labelStyle: TextStyle(color: Color(0xFFCCD0CF)),labelText: "Room ID (e.g., C-101)")),
+            TextField(controller: _capacityController, decoration: InputDecoration(labelStyle: TextStyle(color: Color(0xFFCCD0CF)),labelText: "Capacity"), keyboardType: TextInputType.number),
+            DropdownButtonFormField<String>(
               value: _roomType,
               isExpanded: true,
-              items: ["Lecture", "Lab", "Tutorial"].map((type) => DropdownMenuItem(value: type, child: Text(type))).toList(),
+              items: ["Lecture", "Lab", "Tutorial"].map((type) => DropdownMenuItem(value: type, child: Text(type,style: TextStyle(color: Color(0xFF12212D),),))).toList(),
               onChanged: (val) => setState(() => _roomType = val!),
+              dropdownColor: Color(0xFFCCD0CF),
+              borderRadius: BorderRadius.circular(12.0),
+              decoration: InputDecoration(
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12.0),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12.0),
+                  borderSide: const BorderSide(color: Color(0xFF305979), width: 4.0),
+                ),
+                filled: true,
+                fillColor: Color(0xFFCCD0CF),
+              ),
             ),
             SizedBox(height: 12),
-            ElevatedButton(onPressed: _addClassroom, child: Text("Add Classroom")),
-            Divider(height: 30),
+            ElevatedButton(onPressed: _addClassroom, child: Text("Add Classroom",style: TextStyle(color: Color(0xFF12212D),)),style: ElevatedButton.styleFrom(backgroundColor: Color(0xFFCCD0CF)),),
+            Divider(height: 20),
             ElevatedButton(
               onPressed: _isLoading ? null : _generateTimetable,
               child: _isLoading
-                  ? CircularProgressIndicator(color: Colors.white)
-                  : Text("Generate Timetable"),
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                  ? CircularProgressIndicator(color: Color(0xFFCCD0CF))
+                  : Text("Generate Timetable",style: TextStyle(color: Color(0xFF12212D),)),
+              style: ElevatedButton.styleFrom(backgroundColor: Color(0xFFCCD0CF)),
             ),
-            SizedBox(height: 10),
-            Divider(height: 30),
-            Text("Existing Classrooms", style: Theme.of(context).textTheme.titleLarge),
+            Divider(height: 20),
             Expanded(
-              child: ListView.builder(
-                itemCount: classrooms.length,
-                itemBuilder: (context, index) {
-                  final room = classrooms[index];
-                  return Card(
-                    child: ListTile(
-                      title: Text(room.roomId),
-                      subtitle: Text("Capacity: ${room.capacity}, Type: ${room.type}"),
-                    ),
-                  );
-                },
-              ),
+              child: _buildRawTimetableStream(),
             ),
           ],
         ),
       ),
     );
   }
-}
 
+  Widget _buildRawTimetableStream() {
+    return StreamBuilder<QuerySnapshot>(
+      stream: _db.getTimetableStream(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return Center(child: CircularProgressIndicator());
+        }
+        if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+          return Center(child: Text("Press 'Generate Timetable' to see raw data.",style: TextStyle(
+              color: Color(0xFFFFFFFF))));
+        }
+
+        final docs = snapshot.data!.docs;
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8.0),
+              child: Text("Live Timetable Output (${docs.length} classes scheduled)", style: TextStyle(
+                  color: Color(0xFFFFFFFF))),
+            ),
+            Expanded(
+              child: ListView.builder(
+                itemCount: docs.length,
+                itemBuilder: (context, index) {
+                  final data = docs[index].data() as Map<String, dynamic>;
+                  final courseName = data['courseName'] ?? 'N/A';
+                  final day = data['day'] ?? 'N/A';
+                  final slot = data['slot'] ?? 'N/A';
+                  final room = data['roomId'] ?? 'N/A';
+
+                  return Card(
+                    margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+                    child: ListTile(
+                      dense: true,
+                      title: Text('$courseName'),
+                      subtitle: Text('$day at $slot in Room: $room'),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}

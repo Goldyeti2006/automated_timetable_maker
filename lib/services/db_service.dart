@@ -148,6 +148,12 @@ class DBService {
     await batch.commit();
     print("Successfully added 15 sample students.");
   }
+  // Add this function inside your DBService class
+
+  Stream<QuerySnapshot> getTimetableStream() {
+    return _db.collection('timetable').orderBy('day').orderBy('slot').snapshots();
+  }
 }
+
 
 
